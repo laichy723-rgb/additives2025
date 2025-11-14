@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>添加剂交互思维导图（完整版 — 支持上传 Excel）</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; margin:0; height:100vh; display:flex; overflow:hidden; }
+    #sidebar { width:360px; border-right:1px solid #eee; padding:16px; box-sizing:border-box; overflow:auto; background:#fafafa; }
+    #canvas { flex:1; position:relative; background:#fff; cursor:grab; }
+    h2{ margin:6px 0 12px 0 }
+    .control{ margin-bottom:12px }
+    select, input, button { width:100%; padding:8px; font-size:14px; box-sizing:border-box; margin-top:6px }
+    .info { margin-top:8px; font-size:13px; color:#333 }
+    .node-detail { margin-top:12px; padding:8px; border-radius:8px; background:#fff; border:1px solid #eee; line-height:1.45 }
+    .legend { font-size:13px; margin-top:8px }
+    svg { width:100%; height:100%; display:block; }
+    .node { cursor:pointer; stroke:#fff; stroke-width:1.2px }
+    .link { stroke:#999; stroke-opacity:0.6 }
+    a.small { font-size:13px; color:#0366d6; text-decoration:none }
+    footer { font-size:12px; color:#666; margin-top:12px }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>添加剂思维导图（完整）</h2>
+
+    <div class="control">
+      <label>1) 上传 Excel（可选）：</label>
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+      <small class="info">如果不上传，页面会加载内置示例数据。</small>
+    </div>
+
+    <div class="control">
+      <label>2) 按膜性能筛选（归纳后 11 项）：</label>
+      <select id="propertySelect"><option value="">（全部）</option></select>
+    </div>
+
+    <div class="control">
+      <label>3) 按底层逻辑筛选：</label>
+      <select id="logicSelect">
+        <option value="">（全部）</option>
+        <option value="界面性质">调控油水界面性质</option>
+        <option value="扩散速率">调控单体扩散速率与分布</option>
+        <option value="反应动力学">调控聚合反应动力学</option>
+        <option value="参与聚合">直接参与聚合或修饰产物结构</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <button id="resetView">重置视图（居中与缩放）</button>
+      <button id="exportExcel">导出已解析 Excel（含 Logic 与 Props）</button>
+    </div>
+
+    <div class="info">拖动画布或滚轮缩放；点击任一节点在下方查看详细信息（原始膜性能数据保留在详情中）。</div>
+
+    <div id="detail" class="node-detail">未选择任何添加剂。</div>
+
+    <footer>
+      <div class="legend"><strong>图例：</strong> 圆形=添加剂 / 蓝色=类别 / 根节点=“添加剂”</div>
+      <div style="margin-top:6px">若 Excel 列名与示例不完全一致，程序将尝试宽松匹配列名：例如含“添加剂”“种类”“作用机理”“膜性能”等关键字的列。</div>
+    </footer>
+  </div>
+
+  <div id="canvas"><svg id="svg"></svg></div>
+
+  <!-- D3 -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <!-- SheetJS for Excel parsing & writing -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+
+  <script>
+  // ---------------------------
+  // 配置：性能归纳映射（11 项）
+  // ---------------------------
+  const PERFORMANCE_GROUPS = [
+    { key: "水通量增大", patterns: ["水通量↑","通量增加","flux increase","高通量","通量↑","通量增大"] },
+    { key: "水通量减小", patterns: ["水通量↓","通量下降","flux decrease","通量↓","通量减小"] },
+    { key: "选择性增大", patterns: ["选择性↑","脱盐率↑","salt rejection increase","脱盐率增"] },
+    { key: "选择性减小", patterns: ["选择性↓","脱盐率↓","salt rejection decrease","脱盐率减"] },
+    { key: "抗污染能力增强", patterns: ["抗污染↑","耐污↑","抗污↑","fouling resistance increase","抗污染能力↑","耐污染↑","耐污性↑"] },
+    { key: "抗污染能力减弱", patterns: ["抗污染↓","耐污↓","抗污↓","抗污染能力↓"] },
+    { key: "耐氯性增强", patterns: ["耐氯↑","耐氯性↑","抗氯↑","耐氯增强"] },
+    { key: "耐氯性减弱", patterns: ["耐氯↓","耐氯性↓","抗氯↓"] },
+    { key: "亲水性增强", patterns: ["亲水性↑","hydrophilicity increase","亲水性增"] },
+    { key: "亲水性减弱", patterns: ["亲水性↓","亲水性减"] },
+    { key: "抗菌性增强", patterns: ["抗菌↑","antibacterial","抗菌性↑"] }
+  ];
+
+  // 关键词分类（自动识别底层逻辑）
+  const LOGIC_KEYWORDS = {
+    "界面性质": ["界面","界面张力","润湿","润湿性","界面性质","润湿膜","亲水性改变","界面改性"],
+    "扩散速率": ["扩散","扩散速率","迁移","传质","渗透速率","单体迁移"],
+    "反应动力学": ["反应速率","反应动力学","水解","中和","消耗","生成co2","酸化","碱化"],
+    "参与聚合": ["共聚","参与聚合","修饰","嵌入","形成","反应生成","与tmc反应","与mpd反应","接枝","修饰产物","接枝聚合"]
+  };
+
+  // ---------------------------
+// 内置示例数据（已从 Excel 自动生成）
+// ---------------------------
+const SAMPLE_RECORDS = [
+  {"Category":"共溶剂","Additive":"甲醇","Mechanism":"提高间苯二胺 （MPD） 单体的扩散速率","Performance":"水通量提高5-10倍"},
+  {"Category":"共溶剂","Additive":"乙醇","Mechanism":"提高间苯二胺 （MPD） 单体的扩散速率","Performance":"水通量提高5-10倍"},
+  {"Category":"共溶剂","Additive":"乙二醇","Mechanism":"提高间苯二胺 （MPD） 单体的扩散速率","Performance":"水通量提高5-10倍"},
+  {"Category":"共溶剂","Additive":"木糖醇","Mechanism":"提高间苯二胺 （MPD） 单体的扩散速率","Performance":"水通量提高5-10倍"},
+  {"Category":"极性有机溶剂","Additive":"二甲基亚砜（DMSO）","Mechanism":"参与界面聚合调节交联程度","Performance":"水通量提高3.2倍，脱盐率略降低"},
+  {"Category":"极性有机溶剂","Additive":"六甲基磷酰三胺（HMPA）","Mechanism":"调控界面反应速率，改变PA结构","Performance":"水通量提高81%"},
+  {"Category":"极性有机溶剂","Additive":"三丁基磷酸酯（TBP）","Mechanism":"形成复合物调节反应速率","Performance":"水通量提高8倍"},
+  {"Category":"极性有机溶剂","Additive":"三苯基磷酸酯（TPP）","Mechanism":"形成复合物调节反应速率","Performance":"水通量提高8倍"},
+  {"Category":"表面活性剂","Additive":"十二烷基硫酸钠（SDS）","Mechanism":"降低界面张力、改变膜表面结构","Performance":"水通量增加"},
+  {"Category":"表面活性剂","Additive":"十六烷基三甲基溴化铵（CTAB）","Mechanism":"调控界面及单体分布","Performance":"水通量增大，选择性略降低"},
+  {"Category":"表面活性剂","Additive":"十六烷基三甲基氯化铵（CTAC）","Mechanism":"调控界面性质","Performance":"水通量增大"},
+  {"Category":"表面活性剂","Additive":"三嵌段表面活性剂","Mechanism":"调节PA层结构","Performance":"水通量降低"},
+  {"Category":"表面活性剂","Additive":"十二烷基三甲基溴化铵（DTAB）","Mechanism":"影响界面聚合层形成","Performance":"水通量增大"},
+  {"Category":"无机盐","Additive":"氯化锂（LiCl）","Mechanism":"改变界面张力及单体扩散","Performance":"水通量提高22%"},
+  {"Category":"无机盐","Additive":"氯化钠（NaCl）","Mechanism":"改变界面张力","Performance":"水通量提高22%"},
+  {"Category":"无机盐","Additive":"氯化钙（CaCl2）","Mechanism":"调节界面张力及单体传输","Performance":"水通量提高22%"},
+  {"Category":"碳酸盐","Additive":"碳酸氢铵（NH4HCO3）","Mechanism":"中和反应副产物HCl，形成CO2气泡改变结构","Performance":"水通量提高"},
+  {"Category":"碳酸盐","Additive":"碳酸氢钠（NaHCO3）","Mechanism":"中和HCl形成更疏松结构","Performance":"水通量提高"},
+  {"Category":"亲水高分子","Additive":"聚乙烯醇（PVA）","Mechanism":"抑制单体扩散、改善亲水性","Performance":"水通量提高，抗污染提高"},
+  {"Category":"亲水高分子","Additive":"聚乙二醇（PEG）","Mechanism":"限制扩散、改善亲水性","Performance":"水通量提高，抗污染提高"},
+  {"Category":"亲水高分子","Additive":"聚乙烯吡咯烷酮（PVP）","Mechanism":"调控界面黏度与扩散","Performance":"水通量提高"},
+  {"Category":"天然多酚","Additive":"单宁酸（TA）","Mechanism":"氢键、络合作用抑制MPD扩散，形成致密亲水层","Performance":"水通量提高，选择性提高"},
+  {"Category":"极性有机物","Additive":"甘油","Mechanism":"增加水相黏度，抑制MPD扩散","Performance":"PA变薄、水通量提高"},
+  {"Category":"氨基多酚","Additive":"多巴胺（DA）","Mechanism":"直接参与反应，形成PDA结构","Performance":"亲水性与抗污染能力增强"},
+  {"Category":"氨基酸","Additive":"精氨酸","Mechanism":"参与IP调控结构","Performance":"亲水性提高"},
+  {"Category":"氨基酸","Additive":"氨基酸","Mechanism":"改变界面反应速率","Performance":"亲水性提高"},
+  {"Category":"纳米材料","Additive":"SiO2","Mechanism":"嵌入PA层形成快速通道","Performance":"水通量提高；耐氯性增强"},
+  {"Category":"纳米材料","Additive":"TiO2","Mechanism":"改善亲水性与通道结构","Performance":"水通量提高"},
+  {"Category":"纳米材料","Additive":"Ag","Mechanism":"抗菌 + 调节层结构","Performance":"抗菌性增强"},
+  {"Category":"纳米材料","Additive":"沸石","Mechanism":"快速通道","Performance":"水通量提高"},
+  {"Category":"纳米材料","Additive":"GO","Mechanism":"构建二维纳米通道","Performance":"水通量提高、选择性提高"},
+  {"Category":"纳米材料","Additive":"MOFs","Mechanism":"分子筛效应","Performance":"水通量提高"},
+  {"Category":"纳米材料","Additive":"CNTs","Mechanism":"快速传输通道 + 稳定网络","Performance":"水通量提高；亲水性提高"},
+  {"Category":"纳米材料","Additive":"N-GOQD","Mechanism":"调节结构，吸附单体","Performance":"水通量提高"},
+  {"Category":"纳米材料","Additive":"SGO","Mechanism":"增强亲水性、调节网络","Performance":"水通量提高"},
+  {"Category":"穿梭分子","Additive":"冠醚","Mechanism":"促进MPD单体向有机相扩散","Performance":"水通量提高164%"},
+  {"Category":"亲水性小分子","Additive":"葡萄糖","Mechanism":"通过氢键进入PA层","Performance":"水通量提高86%"},
+  {"Category":"亲水性小分子","Additive":"蔗糖","Mechanism":"通过氢键进入PA层","Performance":"水通量提高86%"},
+  {"Category":"亲水性小分子","Additive":"棉子糖","Mechanism":"通过氢键进入PA层","Performance":"水通量提高86%"}
+];
+
+
+  // ---------------------------
+  // 全局变量（可被上传数据覆盖）
+  // ---------------------------
+  let records = SAMPLE_RECORDS.slice(); // {Category, Additive, Mechanism, Performance}
+  let nodeObjs = [];
+  let links = [];
+  let simulation, svg, g, nodeSelection, linkSelection, zoomBehavior;
+  let currentTransform = d3.zoomIdentity;
+
+  // DOM refs
+  const fileInput = document.getElementById('fileInput');
+  const propSelect = document.getElementById('propertySelect');
+  const logicSelect = document.getElementById('logicSelect');
+  const detailEl = document.getElementById('detail');
+  const exportBtn = document.getElementById('exportExcel');
+  const resetBtn = document.getElementById('resetView');
+
+  // ---------------------------
+  // Helper: classify logic
+  // ---------------------------
+  function classifyLogic(text) {
+    const t = (text || "").toLowerCase();
+    for (const [logic, keys] of Object.entries(LOGIC_KEYWORDS)) {
+      for (const k of keys) {
+        if (t.indexOf(k.toLowerCase()) !== -1) return logic;
+      }
+    }
+    // fallback rules
+    if (/扩散|传质|迁移/.test(t)) return "扩散速率";
+    if (/界面|润湿|张力/.test(t)) return "界面性质";
+    if (/反应|水解|中和|co2|酸|碱/.test(t)) return "反应动力学";
+    return "参与聚合";
+  }
+
+  // ---------------------------
+  // Helper: normalize performance text -> list of归纳 keys
+  // ---------------------------
+  function normalizePerformance(perfText) {
+    if (!perfText) return [];
+    const parts = perfText.split(/[,;；，\/]+/).map(s=>s.trim()).filter(Boolean);
+    const result = new Set();
+    const lower = parts.map(p=>p.toLowerCase());
+    PERFORMANCE_GROUPS.forEach(group=>{
+      group.patterns.forEach(pat=>{
+        const patL = pat.toLowerCase();
+        for (const part of lower) {
+          if (part.indexOf(patL) !== -1) {
+            result.add(group.key);
+          }
+        }
+      });
+    });
+    // Extra heuristics: keywords without the exact pattern
+    lower.forEach(part=>{
+      if (/通量/.test(part) && part.indexOf("↓")===-1 && ![...result].some(r=>r.startsWith("水通量"))) result.add("水通量增大");
+      if (/通量/.test(part) && part.indexOf("↓")!==-1) result.add("水通量减小");
+      if (/(脱盐|选|拒盐|salt)/.test(part) && part.indexOf("↓")!==-1) result.add("选择性减小");
+      if (/(脱盐|选|拒盐|salt)/.test(part) && part.indexOf("↑")!==-1) result.add("选择性增大");
+      if (/(抗污|抗污染|耐污|抗污染)/.test(part) && part.indexOf("↓")===-1) result.add("抗污染能力增强");
+      if (/(耐氯|耐氯性|抗氯)/.test(part) && part.indexOf("↓")===-1) result.add("耐氯性增强");
+      if (/(亲水)/.test(part) && part.indexOf("↓")===-1) result.add("亲水性增强");
+      if (/(抗菌)/.test(part)) result.add("抗菌性增强");
+    });
+    return Array.from(result);
+  }
+
+  // ---------------------------
+  // Parse Excel (SheetJS)
+  // ---------------------------
+  function parseFile(file) {
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const data = new Uint8Array(e.target.result);
+      const workbook = XLSX.read(data, {type: 'array'});
+      // pick first sheet
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const json = XLSX.utils.sheet_to_json(sheet, {defval: ''});
+      // try to map columns (宽松匹配)
+      const colNames = Object.keys(json[0] || {});
+      // identify likely columns
+      const colMap = {};
+      colNames.forEach(c=>{
+        const lc = c.toLowerCase();
+        if (/(添加剂种类|种类|category|分类)/.test(lc)) colMap.Category = c;
+        else if (/(添加剂名称|添加剂|name|additive)/.test(lc)) colMap.Additive = c;
+        else if (/(作用机理|机理|作用|mechanism|影响)/.test(lc)) colMap.Mechanism = c;
+        else if (/(膜性能|性能|performance|影响|效果)/.test(lc)) {
+          // prefer exact "膜性能变化" etc.
+          if (!colMap.Performance) colMap.Performance = c;
+        }
+      });
+      // Fallbacks: try some common names
+      if (!colMap.Additive) {
+        // try first column
+        colMap.Additive = colNames[0];
+      }
+      if (!colMap.Category) {
+        colMap.Category = colNames[1] || colMap.Additive;
+      }
+      if (!colMap.Mechanism) {
+        // try any column containing '机理' else third
+        colMap.Mechanism = colNames.find(c=>/机理|作用|mechanism/.test(c)) || colNames[2] || '';
+      }
+      if (!colMap.Performance) {
+        colMap.Performance = colNames.find(c=>/性能|performance|影响/.test(c)) || '';
+      }
+
+      // build records
+      records = json.map(row=>{
+        const cat = (row[colMap.Category] || '').toString().trim();
+        const name = (row[colMap.Additive] || '').toString().trim();
+        const mech = colMap.Mechanism ? (row[colMap.Mechanism] || '').toString().trim() : '';
+        const perf = colMap.Performance ? (row[colMap.Performance] || '').toString().trim() : '';
+        return { Category: cat || '未分类', Additive: name || '未命名', Mechanism: mech, Performance: perf };
+      });
+
+      // now process and draw
+      processAndRender();
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ---------------------------
+  // Process records -> nodes & links
+  // ---------------------------
+  function processRecordsToNodes() {
+    const categories = Array.from(new Set(records.map(r=>r.Category || '未分类')));
+    nodeObjs = [];
+    nodeObjs.push({ id: '添加剂', type: 'root' });
+    categories.forEach(c => nodeObjs.push({ id: c, type: 'category', parent: '添加剂' }));
+    records.forEach(r=>{
+      const logic = classifyLogic((r.Mechanism || '') + ' ' + (r.Performance || ''));
+      const props = normalizePerformance(r.Performance || '');
+      const obj = {
+        id: r.Additive,
+        type: 'additive',
+        parent: r.Category || '未分类',
+        logic: logic,
+        props: props,
+        desc: r.Mechanism || '',
+        rawPerformance: r.Performance || ''
+      };
+      nodeObjs.push(obj);
+    });
+    links = nodeObjs.filter(n=>n.parent).map(n=>({ source: n.parent, target: n.id }));
+  }
+
+  // ---------------------------
+  // Build D3 visualization
+  // ---------------------------
+  function initSvg() {
+    // clear previous
+    d3.select('#svg').selectAll('*').remove();
+    const width = document.getElementById('canvas').clientWidth;
+    const height = window.innerHeight;
+    svg = d3.select('#svg').attr('viewBox', [0,0,width,height]);
+    g = svg.append('g');
+    zoomBehavior = d3.zoom().scaleExtent([0.3,3]).on('zoom', (event)=>{ g.attr('transform', event.transform); currentTransform = event.transform; });
+    svg.call(zoomBehavior);
+  }
+
+  function renderGraph() {
+    initSvg();
+    const width = document.getElementById('canvas').clientWidth;
+    const height = window.innerHeight;
+
+    simulation = d3.forceSimulation(nodeObjs)
+      .force('link', d3.forceLink(links).id(d=>d.id).distance(110))
+      .force('charge', d3.forceManyBody().strength(-350))
+      .force('center', d3.forceCenter(width/2, height/2))
+      .force('collide', d3.forceCollide().radius(d=> d.type==='category'?40:24))
+      .on('tick', ticked);
+
+    linkSelection = g.append('g').attr('stroke','#999').selectAll('line').data(links).join('line').attr('class','link');
+
+    nodeSelection = g.append('g').selectAll('g').data(nodeObjs).join('g').call(d3.drag()
+      .on('start', (event,d)=>{ if(!event.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (event,d)=>{ d.fx = event.x; d.fy = event.y; })
+      .on('end', (event,d)=>{ if(!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+    nodeSelection.append('circle')
+      .attr('r', d=> d.type==='root'?40: d.type==='category'?28:14)
+      .attr('fill', d=> {
+        if (d.type === 'root') return '#08306b';
+        if (d.type === 'category') return '#2b8cbe';
+        if (d.logic === '界面性质') return '#7b3294';
+        if (d.logic === '扩散速率') return '#a1d99b';
+        if (d.logic === '反应动力学') return '#fdae61';
+        if (d.logic === '参与聚合') return '#e34a33';
+        return '#ccc';
+      })
+      .attr('class','node')
+      .on('click', (e,d)=> showDetail(d))
+      .on('mouseover', function(){ d3.select(this).attr('stroke','#000'); })
+      .on('mouseout', function(){ d3.select(this).attr('stroke','#fff'); });
+
+    nodeSelection.append('text')
+      .attr('x', 12)
+      .attr('y', 4)
+      .text(d=>d.id)
+      .style('font-size','12px');
+
+    // initialize selects
+    initPropertySelect();
+    applyFilters(); // initial fade
+
+    // center view
+    resetView();
+  }
+
+  function ticked() {
+    linkSelection
+      .attr('x1', d=>d.source.x)
+      .attr('y1', d=>d.source.y)
+      .attr('x2', d=>d.target.x)
+      .attr('y2', d=>d.target.y);
+    nodeSelection.attr('transform', d=>`translate(${d.x},${d.y})`);
+  }
+
+  // ---------------------------
+  // Show detail box
+  // ---------------------------
+  function showDetail(d) {
+    if (!d) return;
+    if (d.type === 'root') {
+      detailEl.innerHTML = `<strong>${d.id}</strong><br>作为所有类别的总节点。`;
+      return;
+    }
+    if (d.type === 'category') {
+      detailEl.innerHTML = `<strong>类别：</strong>${d.id}<br>包含多个具体添加剂。`;
+      return;
+    }
+    // additive
+    const rawPerf = d.rawPerformance || '';
+    const props = (d.props && d.props.length) ? d.props.join('; ') : '—';
+    detailEl.innerHTML = `
+      <strong>${d.id}</strong><br>
+      <em>类别：</em>${d.parent || '—'}<br>
+      <em>底层逻辑：</em>${d.logic || '—'}<br>
+      <em>归纳性能：</em>${props}<br>
+      <em>原始膜性能描述：</em><div style="margin-top:6px; padding:6px; background:#fff; border-radius:4px; border:1px solid #eee;">${rawPerf || '—'}</div>
+      <em>作用机理：</em><div style="margin-top:6px; padding:6px; background:#fff; border-radius:4px; border:1px solid #eee;">${d.desc || '—'}</div>
+    `;
+  }
+
+  // ---------------------------
+  // Property select initialization (fixed 11 options)
+  // ---------------------------
+  function initPropertySelect() {
+    // clear existing (keep first option)
+    while (propSelect.options.length > 1) propSelect.remove(1);
+    const fixedOptions = [
+      "水通量增大","水通量减小",
+      "选择性增大","选择性减小",
+      "抗污染能力增强","抗污染能力减弱",
+      "耐氯性增强","耐氯性减弱",
+      "亲水性增强","亲水性减弱",
+      "抗菌性增强"
+    ];
+    fixedOptions.forEach(optVal=>{
+      const opt = document.createElement('option');
+      opt.value = optVal;
+      opt.textContent = optVal;
+      propSelect.appendChild(opt);
+    });
+  }
+
+  // ---------------------------
+  // Apply filters
+  // ---------------------------
+  function applyFilters() {
+    const p = propSelect.value;
+    const lg = logicSelect.value;
+    nodeSelection.style('opacity', nd=>{
+      if (nd.type === 'category') return 0.6;
+      // property filter: check normalized props (d.props)
+      if (p && (!nd.props || nd.props.indexOf(p) === -1)) return 0.12;
+      if (lg && nd.logic && nd.logic !== lg) return 0.12;
+      return 1;
+    });
+  }
+
+  // ---------------------------
+  // Utilities: reset view, export excel
+  // ---------------------------
+  function resetView() {
+    if (!svg || !zoomBehavior) return;
+    const width = document.getElementById('canvas').clientWidth;
+    const height = window.innerHeight;
+    // reset transform
+    svg.transition().duration(300).call(zoomBehavior.transform, d3.zoomIdentity.translate(0,0).scale(1));
+  }
+
+  function exportProcessedExcel() {
+    // build sheet from processed 'records' with Logic and Props
+    const outRows = records.map(r=>{
+      const logic = classifyLogic((r.Mechanism||'') + ' ' + (r.Performance||''));
+      const props = normalizePerformance(r.Performance||'').join('; ');
+      return {
+        添加剂种类: r.Category,
+        添加剂名称: r.Additive,
+        作用机理及对分离层的影响: r.Mechanism,
+        膜性能变化: r.Performance,
+        Logic: logic,
+        Props: props
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(outRows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'processed');
+    const wbout = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+    const blob = new Blob([wbout], {type: 'application/octet-stream'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '添加剂信息库_processed.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // ---------------------------
+  // Wiring
+  // ---------------------------
+  fileInput.addEventListener('change', (e)=> {
+    const f = e.target.files[0];
+    if (!f) return;
+    parseFile(f);
+  });
+
+  propSelect.addEventListener('change', applyFilters);
+  logicSelect.addEventListener('change', applyFilters);
+  exportBtn.addEventListener('click', exportProcessedExcel);
+  resetBtn.addEventListener('click', resetView);
+
+  // ---------------------------
+  // Process & render (entry)
+  // ---------------------------
+  function processAndRender() {
+    processRecordsToNodes();
+    renderGraph();
+  }
+
+  // initial render with sample or existing records
+  processAndRender();
+
+  // responsive resize
+  window.addEventListener('resize', ()=>{
+    if (simulation) simulation.alpha(0.2).restart();
+    // re-center view if needed
+  });
+
+  </script>
+</body>
+</html>
